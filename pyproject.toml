@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "profilist"
-version = "1.0.0"
+version = "2.0.0"
 description = "A collection of code for profilist."
 authors = [{name="GAO Hongnan", email="hongnangao@gmail.com"}]
 readme = "README.md"
@@ -17,7 +17,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
-dependencies = []
+dependencies = [
+    "pydantic>=2.11.7",
+]
 
 
 [project.urls]

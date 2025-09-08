@@ -88,9 +88,7 @@ class Timer:
         self.__exit__(exc_type, exc_val, exc_tb)
 
 
-def timer(
-    name: str | None = None, *, silent: bool = False
-) -> Callable[[Callable[P, R]], Callable[P, R]]:
+def timer(name: str | None = None, *, silent: bool = False) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator to time function execution (supports both sync and async functions).
 
     Parameters
