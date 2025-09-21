@@ -4,19 +4,28 @@ import cProfile
 import io
 import json
 import pstats
-from typing import TYPE_CHECKING, Self
-
-if TYPE_CHECKING:
-    from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 from ..models import CProfileConfig, ProfileResult
+
+if TYPE_CHECKING:
+    from typing import TextIO
+
+
+class StatsWithStream(Protocol):
+    stream: TextIO
+    stats: dict[tuple[str, int, str], tuple[int, int, float, float, dict[Any, Any]]]
+    total_tt: float
+
+    def print_stats(self, *args: Any) -> None: ...
+    def sort_stats(self, *args: Any) -> None: ...
 
 
 class CProfileProfiler:
     def __init__(self, config: CProfileConfig | None = None) -> None:
         self.config = config or CProfileConfig()
         self._profiler = cProfile.Profile()
-        self._stats: pstats.Stats | None = None
+        self._stats: StatsWithStream | None = None
 
     def __enter__(self) -> Self:
         self._profiler.enable()
@@ -24,8 +33,9 @@ class CProfileProfiler:
 
     def __exit__(self, *args: object) -> None:
         self._profiler.disable()
-        self._stats = pstats.Stats(self._profiler)
-        self._stats.sort_stats(self.config.sort_by)
+        stats = pstats.Stats(self._profiler)
+        stats.sort_stats(self.config.sort_by)
+        self._stats = cast(StatsWithStream, stats)
 
         if self.config.output_path:
             self._save_report()
@@ -74,18 +84,18 @@ class CProfileProfiler:
             stream = io.StringIO()
             stream.write("<html><body><h1>Profile Report</h1><pre>")
             original_stream = getattr(self._stats, "stream", None)
-            self._stats.stream = stream  # type: ignore[attr-defined]
+            self._stats.stream = stream
             self._stats.print_stats(self.config.top_n)
             stream.write("</pre></body></html>")
             if original_stream:
-                self._stats.stream = original_stream  # type: ignore[attr-defined]
+                self._stats.stream = original_stream
             return stream.getvalue()
 
         else:
             stream = io.StringIO()
             original_stream = getattr(self._stats, "stream", None)
-            self._stats.stream = stream  # type: ignore[attr-defined]
+            self._stats.stream = stream
             self._stats.print_stats(self.config.top_n)
             if original_stream:
-                self._stats.stream = original_stream  # type: ignore[attr-defined]
+                self._stats.stream = original_stream
             return stream.getvalue()

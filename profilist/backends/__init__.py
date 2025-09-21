@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ..profiler import ProfilerFactory
 from .cprofile import CProfileProfiler
 
 ProfilerFactory.register("cprofile", CProfileProfiler)
 
-try:
+if TYPE_CHECKING:
     from .scalene import ScaleneProfiler
-except ImportError:
-    ScaleneProfiler = None  # type: ignore[assignment, misc]
+else:
+    try:
+        from .scalene import ScaleneProfiler
+    except ImportError:
+        ScaleneProfiler = None
 
 __all__ = ["CProfileProfiler", "ScaleneProfiler"]
