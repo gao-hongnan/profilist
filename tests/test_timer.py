@@ -92,3 +92,39 @@ class TestTimerDecorator:
 
         result = await concat_strings("hello", "world")
         assert result == "hello-world"
+
+    def test_decorator_warns_on_generator_function(self) -> None:
+        with pytest.warns(UserWarning) as warning_records:
+
+            @timer(silent=True)
+            def my_generator(n: int):
+                for i in range(n):
+                    yield i * 2
+
+        assert len(warning_records) == 1
+        warning_msg = str(warning_records[0].message)
+        assert "does not properly time generator function 'my_generator'" in warning_msg
+        assert "only measure generator object creation" in warning_msg
+
+        gen = my_generator(3)
+        values = list(gen)
+        assert values == [0, 2, 4]
+
+    @pytest.mark.asyncio
+    async def test_decorator_warns_on_async_generator_function(self) -> None:
+        with pytest.warns(UserWarning) as warning_records:
+
+            @timer(silent=True)
+            async def my_async_generator(n: int):
+                for i in range(n):
+                    await asyncio.sleep(0.001)
+                    yield i * 3
+
+        assert len(warning_records) == 1
+        warning_msg = str(warning_records[0].message)
+        assert "does not properly time generator function 'my_async_generator'" in warning_msg
+        assert "only measure generator object creation" in warning_msg
+
+        async_gen = my_async_generator(2)
+        values = [val async for val in async_gen]
+        assert values == [0, 3]

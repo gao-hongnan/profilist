@@ -5,6 +5,7 @@ import inspect
 import logging
 import timeit
 import types
+import warnings
 from typing import (
     Callable,
     Coroutine,
@@ -119,6 +120,16 @@ def timer(name: str | None = None, *, silent: bool = False) -> Callable[[Callabl
     """
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
+        if inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func):
+            warnings.warn(
+                f"@timer decorator does not properly time generator function '{func.__name__}'. "
+                f"Timer will only measure generator object creation, not iteration time.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        func = cast(Callable[P, R], func)
+
         if inspect.iscoroutinefunction(func):
 
             @functools.wraps(func)
