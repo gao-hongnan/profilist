@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import AsyncGenerator, Generator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -97,7 +98,7 @@ class TestTimerDecorator:
         with pytest.warns(UserWarning) as warning_records:
 
             @timer(silent=True)
-            def my_generator(n: int):
+            def my_generator(n: int) -> Generator[int, None, None]:
                 for i in range(n):
                     yield i * 2
 
@@ -115,7 +116,7 @@ class TestTimerDecorator:
         with pytest.warns(UserWarning) as warning_records:
 
             @timer(silent=True)
-            async def my_async_generator(n: int):
+            async def my_async_generator(n: int) -> AsyncGenerator[int, None]:
                 for i in range(n):
                     await asyncio.sleep(0.001)
                     yield i * 3

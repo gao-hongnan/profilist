@@ -46,7 +46,7 @@ class Timer:
     >>> result = t.elapsed_seconds
     """
 
-    __slots__ = ("_name", "_silent", "_start", "elapsed_seconds")
+    __slots__ = ("_name", "_silent", "_start", "_end")
 
     def __init__(self, name: str | None = None, *, silent: bool = False) -> None:
         """Initialize the timer.
@@ -60,10 +60,19 @@ class Timer:
         """
         self._name = name
         self._silent = silent
-        self.elapsed_seconds: float = 0
+        self._start: float | None = None
+        self._end: float | None = None
+
+    @property
+    def elapsed_seconds(self) -> float:
+        if self._start is None:
+            return 0.0
+        end = self._end if self._end is not None else timeit.default_timer()
+        return end - self._start
 
     def __enter__(self) -> Self:
         self._start = timeit.default_timer()
+        self._end = None
         return self
 
     def __exit__(
@@ -72,7 +81,7 @@ class Timer:
         exc_val: BaseException | None,
         exc_tb: types.TracebackType | None,
     ) -> None:
-        self.elapsed_seconds = timeit.default_timer() - self._start
+        self._end = timeit.default_timer()
         if not self._silent:
             name = self._name or "code"
             logger.info(f"{name} took {self.elapsed_seconds:.4f} seconds to execute.")
