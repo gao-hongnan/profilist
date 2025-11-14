@@ -10,13 +10,8 @@ from contextlib import asynccontextmanager, contextmanager
 from types import TracebackType
 from typing import Any, TypeVar
 
+import psutil
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
-
-try:
-    import psutil
-except ImportError:
-    psutil = None  # type: ignore
-
 
 T = TypeVar("T")
 

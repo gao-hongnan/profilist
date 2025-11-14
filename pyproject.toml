@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "profilist"
-version = "4.0.0"
+version = "5.0.0"
 description = "A collection of code for profilist."
 authors = [{name="GAO Hongnan", email="hongnangao@gmail.com"}]
 readme = "README.md"
