@@ -124,9 +124,6 @@ class MemoryProfiler:
         self.track_objects = track_objects
         self.enable_gc_before_snapshot = enable_gc_before_snapshot
 
-        if psutil is None:
-            raise ImportError("psutil is required for MemoryProfiler. Install with: pip install psutil")
-
         self._is_running = False
         self._started_tracemalloc = False
         self._baseline_snapshot: ComprehensiveSnapshot | None = None
