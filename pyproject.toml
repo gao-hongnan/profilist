@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "profilist"
-version = "3.0.0"
+version = "4.0.0"
 description = "A collection of code for profilist."
 authors = [{name="GAO Hongnan", email="hongnangao@gmail.com"}]
 readme = "README.md"
@@ -18,12 +18,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "pydantic>=2.11.7"
+    "pydantic>=2.11.7",
+    "psutil>=5.9.0",
 ]
 
 [project.optional-dependencies]
 memory = [
-    "scalene>=1.5.0"
+    "scalene>=1.5.0",
+    "cffi>=1.15.0",
 ]
 
 

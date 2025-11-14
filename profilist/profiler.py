@@ -87,7 +87,7 @@ class ComprehensiveSnapshot(BaseModel):
 class AllocationDifference(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    filename: str
+    filename: str = Field(default="<unknown>")
     lineno: int = Field(ge=0)
     size_diff_bytes: int
     size_diff_mb: float
@@ -95,12 +95,12 @@ class AllocationDifference(BaseModel):
     size_before_bytes: int = Field(ge=0)
     size_after_bytes: int = Field(ge=0)
 
-    @field_validator("filename")
+    @field_validator("filename", mode="before")
     @classmethod
-    def validate_filename(cls, v: str) -> str:
+    def validate_filename(cls, v: str | None) -> str:
         if not v:
             return "<unknown>"
-        return v
+        return str(v)
 
 
 class LeakReport(BaseModel):
@@ -140,9 +140,11 @@ class MemoryProfiler:
         self._task_name: str | None = None
 
         if baseline_snapshot:
-            self._start_profiling()
-            self._baseline_snapshot = self._take_snapshot()
-            self._stop_profiling()
+            try:
+                self._start_profiling()
+                self._baseline_snapshot = self._take_snapshot()
+            finally:
+                self._stop_profiling()
 
     def _start_profiling(self) -> None:
         if not tracemalloc.is_tracing():
@@ -157,12 +159,14 @@ class MemoryProfiler:
         self._is_running = False
 
     def _get_process_info(self) -> tuple[int, int, float, int]:
-        process = psutil.Process(os.getpid())
-        mem_info = process.memory_info()
-        mem_percent = process.memory_percent()
-        available = psutil.virtual_memory().available
-
-        return (mem_info.rss, mem_info.vms, mem_percent, available)
+        try:
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            mem_percent = process.memory_percent()
+            available = psutil.virtual_memory().available
+            return (mem_info.rss, mem_info.vms, mem_percent, available)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+            raise RuntimeError(f"Failed to get process info: {e}") from e
 
     def _get_gc_info(self) -> tuple[int, int, int, int, int]:
         gc_counts = gc.get_count()
@@ -177,7 +181,10 @@ class MemoryProfiler:
     def _get_object_count(self) -> int:
         if not self.track_objects:
             return 0
-        return len(gc.get_objects())
+        try:
+            return len(gc.get_objects())
+        except Exception:
+            return 0
 
     def _take_snapshot(self, label: str | None = None) -> ComprehensiveSnapshot:
         context_info = {"label": label} if label else {}
@@ -269,7 +276,7 @@ class MemoryProfiler:
         else:
             growing_objects = {}
 
-        uncollectable = gc.get_stats()[-1].get("uncollectable", 0)
+        uncollectable = len(gc.garbage)
         if uncollectable > 0:
             recommendations.append(
                 f"Found {uncollectable} uncollectable objects. Review __del__ methods and circular refs."
@@ -286,6 +293,13 @@ class MemoryProfiler:
 
     def get_top_allocations(self, limit: int = 10, key_type: str = "lineno") -> list[dict[str, Any]]:
         if not tracemalloc.is_tracing():
+            import warnings
+
+            warnings.warn(
+                "tracemalloc is not active. Use the profiler as a context manager or call start().",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return []
 
         results = []
@@ -361,8 +375,10 @@ class MemoryProfiler:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        self.snapshot()
-        self._stop_profiling()
+        try:
+            self.snapshot()
+        finally:
+            self._stop_profiling()
 
     async def __aenter__(self) -> ComprehensiveSnapshot:
         self._start_profiling()
@@ -374,8 +390,10 @@ class MemoryProfiler:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        self.snapshot()
-        self._stop_profiling()
+        try:
+            self.snapshot()
+        finally:
+            self._stop_profiling()
 
 
 @contextmanager
