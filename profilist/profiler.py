@@ -25,7 +25,7 @@ type KeyType = Literal["lineno", "filename", "traceback"]
 type Unit = Literal["bytes", "kb", "mb"]
 
 
-class ComprehensiveSnapshot(BaseModel):
+class Snapshot(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     created_at: datetime
@@ -173,9 +173,9 @@ class MemoryProfiler:
         self._gc_info = gc_info_provider or GCStatsCollector()
 
         self._is_running = False
-        self._baseline_snapshot: ComprehensiveSnapshot | None = None
-        self._current_snapshot: ComprehensiveSnapshot | None = None
-        self._snapshots: deque[ComprehensiveSnapshot] = deque(maxlen=max_snapshots)
+        self._baseline_snapshot: Snapshot | None = None
+        self._current_snapshot: Snapshot | None = None
+        self._snapshots: deque[Snapshot] = deque(maxlen=max_snapshots)
 
         if baseline_snapshot:
             try:
@@ -204,7 +204,7 @@ class MemoryProfiler:
         except Exception:
             return 0
 
-    def _take_snapshot(self, label: str | None = None) -> ComprehensiveSnapshot:
+    def _take_snapshot(self, label: str | None = None) -> Snapshot:
         context_metadata: ContextInfo = {"label": label} if label else {}
 
         try:
@@ -228,7 +228,7 @@ class MemoryProfiler:
 
         native_bytes = max(0, rss_bytes - current_heap_bytes)
 
-        return ComprehensiveSnapshot(
+        return Snapshot(
             created_at=now,
             timestamp_iso8601=iso_timestamp,
             current_python_heap_memory=self._format_memory(current_heap_bytes),
@@ -252,7 +252,7 @@ class MemoryProfiler:
             context_metadata=context_metadata,
         )
 
-    def snapshot(self, label: str | None = None) -> ComprehensiveSnapshot:
+    def snapshot(self, label: str | None = None) -> Snapshot:
         if not self._is_running:
             raise RuntimeError("Profiler is not running. Use as context manager or call start().")
 
@@ -410,15 +410,15 @@ class MemoryProfiler:
             )
 
     @property
-    def baseline(self) -> ComprehensiveSnapshot | None:
+    def baseline(self) -> Snapshot | None:
         return self._baseline_snapshot
 
     @property
-    def latest(self) -> ComprehensiveSnapshot | None:
+    def latest(self) -> Snapshot | None:
         return self._current_snapshot
 
     @property
-    def all_snapshots(self) -> list[ComprehensiveSnapshot]:
+    def all_snapshots(self) -> list[Snapshot]:
         return list(self._snapshots)
 
     def __enter__(self) -> Self:
