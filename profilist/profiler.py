@@ -5,7 +5,7 @@ import gc
 import os
 import tracemalloc
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import TracebackType
@@ -19,6 +19,8 @@ BYTES_PER_MB: int = 1024 * 1024
 
 type KeyType = Literal["lineno", "filename", "traceback"]
 type Unit = Literal["bytes", "kb", "mb"]
+type MemoryValue = int | float
+type ObjectCount = int
 
 
 class ProfilerConfig(BaseModel):
@@ -39,10 +41,11 @@ class ProfilerConfig(BaseModel):
 class ProcessMemoryInfo(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    resident_set_size_bytes: int = Field(ge=0)
-    virtual_memory_size_bytes: int = Field(ge=0)
+    resident_set_size: MemoryValue = Field(ge=0)
+    virtual_memory_size: MemoryValue = Field(ge=0)
     memory_usage_percent: float = Field(ge=0.0, le=100.0)
-    system_available_bytes: int = Field(ge=0)
+    system_available: MemoryValue = Field(ge=0)
+    unit: Unit
 
 
 class GCStatistics(BaseModel):
@@ -51,23 +54,24 @@ class GCStatistics(BaseModel):
     generation0_collections: int = Field(ge=0)
     generation1_collections: int = Field(ge=0)
     generation2_collections: int = Field(ge=0)
-    objects_collected: int = Field(ge=0)
-    uncollectable_objects: int = Field(ge=0)
+    objects_collected: ObjectCount = Field(ge=0)
+    uncollectable_objects: ObjectCount = Field(ge=0)
 
 
 class HeapMemoryInfo(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    current_bytes: int = Field(ge=0)
-    peak_bytes: int = Field(ge=0)
+    current: MemoryValue = Field(ge=0)
+    peak: MemoryValue = Field(ge=0)
     allocation_sites_tracked: int = Field(ge=0)
+    unit: Unit
 
 
 class ObjectTracking(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    total_allocated_objects: int = Field(ge=0)
-    object_growth_since_baseline: int
+    total_allocated_objects: ObjectCount = Field(ge=0)
+    object_growth_since_baseline: ObjectCount
 
 
 class SnapshotMetadata(BaseModel):
@@ -93,19 +97,12 @@ class Snapshot(BaseModel):
 class AllocationInfo(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    size_bytes: int = Field(ge=0)
+    size: MemoryValue = Field(ge=0)
     count: int = Field(ge=0)
     filename: str = "<unknown>"
     lineno: int = Field(default=0, ge=0)
     trace: str | None = None
-
-    @property
-    def size_mb(self) -> float:
-        return self.size_bytes / BYTES_PER_MB
-
-    @property
-    def size_kb(self) -> float:
-        return self.size_bytes / BYTES_PER_KB
+    unit: Unit
 
 
 class AllocationDifference(BaseModel):
@@ -113,18 +110,11 @@ class AllocationDifference(BaseModel):
 
     filename: str = "<unknown>"
     lineno: int = Field(default=0, ge=0)
-    size_diff_bytes: int
+    size_diff: MemoryValue
     count_diff: int
-    size_before_bytes: int = Field(ge=0)
-    size_after_bytes: int = Field(ge=0)
-
-    @property
-    def size_diff_mb(self) -> float:
-        return self.size_diff_bytes / BYTES_PER_MB
-
-    @property
-    def size_diff_kb(self) -> float:
-        return self.size_diff_bytes / BYTES_PER_KB
+    size_before: MemoryValue = Field(ge=0)
+    size_after: MemoryValue = Field(ge=0)
+    unit: Unit
 
 
 class CircularReference(BaseModel):
@@ -137,17 +127,10 @@ class CircularReference(BaseModel):
 class MemoryGrowth(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    heap_growth_bytes: int
-    rss_growth_bytes: int
-    object_count_growth: int
-
-    @property
-    def heap_growth_mb(self) -> float:
-        return self.heap_growth_bytes / BYTES_PER_MB
-
-    @property
-    def rss_growth_mb(self) -> float:
-        return self.rss_growth_bytes / BYTES_PER_MB
+    heap_growth: MemoryValue
+    rss_growth: MemoryValue
+    object_count_growth: ObjectCount
+    unit: Unit
 
 
 class LeakReport(BaseModel):
@@ -162,17 +145,18 @@ class LeakReport(BaseModel):
 
 
 class ProcessInfoCollector:
-    def get_process_info(self) -> ProcessMemoryInfo:
+    def get_process_info(self, convert_fn: Callable[[int], MemoryValue], unit: Unit) -> ProcessMemoryInfo:
         try:
             process = psutil.Process(os.getpid())
             mem_info = process.memory_info()
             mem_percent = process.memory_percent()
             available = psutil.virtual_memory().available
             return ProcessMemoryInfo(
-                resident_set_size_bytes=mem_info.rss,
-                virtual_memory_size_bytes=mem_info.vms,
+                resident_set_size=convert_fn(mem_info.rss),
+                virtual_memory_size=convert_fn(mem_info.vms),
                 memory_usage_percent=mem_percent,
-                system_available_bytes=available,
+                system_available=convert_fn(available),
+                unit=unit,
             )
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
             raise RuntimeError(f"Failed to get process info: {e}") from e
@@ -271,6 +255,15 @@ class MemoryProfiler:
             return 0
         return len(gc.get_objects())
 
+    def _convert_bytes(self, value_bytes: int) -> MemoryValue:
+        match self._config.memory_unit:
+            case "bytes":
+                return value_bytes
+            case "kb":
+                return round(value_bytes / BYTES_PER_KB, self._config.decimal_places)
+            case "mb":
+                return round(value_bytes / BYTES_PER_MB, self._config.decimal_places)
+
     def _take_snapshot(self, label: str | None = None) -> Snapshot:
         async_task_name: str | None = None
         try:
@@ -285,7 +278,7 @@ class MemoryProfiler:
         current_heap_bytes, peak_heap_bytes = self._tracemalloc_manager.get_traced_memory()
         tracemalloc_snap = self._tracemalloc_manager.take_snapshot()
 
-        process_memory = self._process_info.get_process_info()
+        process_memory = self._process_info.get_process_info(self._convert_bytes, self._config.memory_unit)
         gc_statistics = self._gc_info.get_gc_info(self._config.enable_gc_before_snapshot)
         total_objects = self._get_object_count()
         object_growth = total_objects - (
@@ -300,9 +293,10 @@ class MemoryProfiler:
         )
 
         heap_memory = HeapMemoryInfo(
-            current_bytes=current_heap_bytes,
-            peak_bytes=peak_heap_bytes,
+            current=self._convert_bytes(current_heap_bytes),
+            peak=self._convert_bytes(peak_heap_bytes),
             allocation_sites_tracked=len(tracemalloc_snap.statistics("lineno")),
+            unit=self._config.memory_unit,
         )
 
         object_tracking = ObjectTracking(
@@ -352,21 +346,21 @@ class MemoryProfiler:
         if len(self._snapshots) >= 2:
             first, last = self._snapshots[0], self._snapshots[-1]
 
-            heap_growth_bytes = last.heap_memory.current_bytes - first.heap_memory.current_bytes
-            rss_growth_bytes = (
-                last.process_memory.resident_set_size_bytes - first.process_memory.resident_set_size_bytes
-            )
+            heap_growth = last.heap_memory.current - first.heap_memory.current
+            rss_growth = last.process_memory.resident_set_size - first.process_memory.resident_set_size
             object_count_growth = (
                 last.object_tracking.total_allocated_objects - first.object_tracking.total_allocated_objects
             )
 
             memory_growth = MemoryGrowth(
-                heap_growth_bytes=heap_growth_bytes,
-                rss_growth_bytes=rss_growth_bytes,
+                heap_growth=heap_growth,
+                rss_growth=rss_growth,
                 object_count_growth=object_count_growth,
+                unit=self._config.memory_unit,
             )
 
-            if rss_growth_bytes > heap_growth_bytes + threshold_bytes:
+            threshold = self._convert_bytes(threshold_bytes)
+            if rss_growth > heap_growth + threshold:
                 native_leak_suspected = True
 
         top_growing_types: dict[str, int] = {}
@@ -378,6 +372,7 @@ class MemoryProfiler:
                 obj_types[type(obj).__name__] = obj_types.get(type(obj).__name__, 0) + 1
             top_growing_types = dict(sorted(obj_types.items(), key=lambda x: x[1], reverse=True)[:10])
 
+        threshold = self._convert_bytes(threshold_bytes)
         has_leaks = bool(
             gc.garbage
             or circular_refs
@@ -385,7 +380,7 @@ class MemoryProfiler:
             or (
                 memory_growth
                 and (
-                    memory_growth.heap_growth_bytes > threshold_bytes
+                    memory_growth.heap_growth > threshold
                     or memory_growth.object_count_growth > self._config.object_growth_threshold
                 )
             )
@@ -433,11 +428,12 @@ class MemoryProfiler:
 
             results.append(
                 AllocationInfo(
-                    size_bytes=stat.size,
+                    size=self._convert_bytes(stat.size),
                     count=stat.count,
                     filename=filename,
                     lineno=lineno,
                     trace=trace,
+                    unit=self._config.memory_unit,
                 )
             )
 
@@ -484,10 +480,11 @@ class MemoryProfiler:
                 AllocationDifference(
                     filename=filename,
                     lineno=lineno,
-                    size_diff_bytes=stat_diff.size_diff,
+                    size_diff=self._convert_bytes(stat_diff.size_diff),
                     count_diff=stat_diff.count_diff,
-                    size_before_bytes=stat_diff.size - stat_diff.size_diff,
-                    size_after_bytes=stat_diff.size,
+                    size_before=self._convert_bytes(stat_diff.size - stat_diff.size_diff),
+                    size_after=self._convert_bytes(stat_diff.size),
+                    unit=self._config.memory_unit,
                 )
             )
         return results
