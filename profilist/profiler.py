@@ -3,17 +3,17 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
-import time
 import tracemalloc
 from collections import deque
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
+from datetime import UTC, datetime
 from itertools import islice
 from types import TracebackType
-from typing import Literal, Protocol
+from typing import Literal, Protocol, Self
 
 import psutil
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 BYTES_PER_KB: int = 1024
 BYTES_PER_MB: int = 1024 * 1024
@@ -22,56 +22,33 @@ DEFAULT_SNAPSHOT_LIMIT: int = 100
 
 type ContextInfo = dict[str, str | int | float | bool]
 type KeyType = Literal["lineno", "filename", "traceback"]
+type Unit = Literal["bytes", "kb", "mb"]
 
 
 class ComprehensiveSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
-    timestamp: float
-    python_heap_current_bytes: int
-    python_heap_peak_bytes: int
-    allocation_count: int
-    rss_bytes: int
-    vms_bytes: int
-    percent_memory: float
-    available_memory_bytes: int
-    gc_gen0_count: int
-    gc_gen1_count: int
-    gc_gen2_count: int
-    gc_collected: int
-    gc_uncollectable: int
-    total_objects: int
-    object_growth: int
+    created_at: datetime
+    timestamp_iso8601: str
+    current_python_heap_memory: float
+    peak_python_heap_memory: float
+    resident_set_size_memory: float
+    virtual_memory_size: float
+    system_available_memory: float
+    native_memory_allocated: float
+    memory_usage_percent: float
+    total_allocated_objects: int
+    object_growth_since_baseline: int
+    gc_generation0_collections: int
+    gc_generation1_collections: int
+    gc_generation2_collections: int
+    gc_objects_collected: int
+    gc_uncollectable_objects: int
+    allocation_sites_tracked: int
+    memory_unit: Unit
+    decimal_precision: int
     tracemalloc_snapshot: tracemalloc.Snapshot | None = None
-    context_info: ContextInfo = Field(default_factory=dict)
-
-    @computed_field
-    def python_heap_mb(self) -> float:
-        return self.python_heap_current_bytes / BYTES_PER_MB
-
-    @computed_field
-    def python_heap_peak_mb(self) -> float:
-        return self.python_heap_peak_bytes / BYTES_PER_MB
-
-    @computed_field
-    def rss_mb(self) -> float:
-        return self.rss_bytes / BYTES_PER_MB
-
-    @computed_field
-    def vms_mb(self) -> float:
-        return self.vms_bytes / BYTES_PER_MB
-
-    @computed_field
-    def available_memory_mb(self) -> float:
-        return self.available_memory_bytes / BYTES_PER_MB
-
-    @computed_field
-    def native_memory_bytes(self) -> int:
-        return max(0, self.rss_bytes - self.python_heap_current_bytes)
-
-    @computed_field
-    def native_memory_mb(self) -> float:
-        return max(0, self.rss_bytes - self.python_heap_current_bytes) / BYTES_PER_MB
+    context_metadata: ContextInfo = Field(default_factory=dict)
 
 
 class AllocationInfo(BaseModel):
@@ -176,6 +153,8 @@ class MemoryProfiler:
     def __init__(
         self,
         *,
+        memory_unit: Unit = "mb",
+        decimal_places: int = 2,
         track_objects: bool = True,
         enable_gc_before_snapshot: bool = False,
         baseline_snapshot: bool = True,
@@ -183,6 +162,8 @@ class MemoryProfiler:
         process_info_provider: ProcessInfoProvider | None = None,
         gc_info_provider: GCInfoProvider | None = None,
     ) -> None:
+        self._memory_unit: Unit = memory_unit
+        self._decimal_places: int = decimal_places
         self._track_objects = track_objects
         self._enable_gc_before_snapshot = enable_gc_before_snapshot
         self._max_snapshots = max_snapshots
@@ -203,6 +184,10 @@ class MemoryProfiler:
             finally:
                 self._stop_profiling()
 
+    def _format_memory(self, bytes_val: int) -> float:
+        divisor = BYTES_PER_MB if self._memory_unit == "mb" else BYTES_PER_KB if self._memory_unit == "kb" else 1
+        return round(bytes_val / divisor, self._decimal_places)
+
     def _start_profiling(self) -> None:
         self._tracemalloc_manager.start()
         self._is_running = True
@@ -220,40 +205,51 @@ class MemoryProfiler:
             return 0
 
     def _take_snapshot(self, label: str | None = None) -> ComprehensiveSnapshot:
-        context_info: ContextInfo = {"label": label} if label else {}
+        context_metadata: ContextInfo = {"label": label} if label else {}
 
         try:
             if task := asyncio.current_task():
-                context_info["async_task"] = task.get_name()
+                context_metadata["async_task"] = task.get_name()
         except RuntimeError:
             pass
 
-        current_heap, peak_heap = self._tracemalloc_manager.get_traced_memory()
+        now = datetime.now(UTC)
+        iso_timestamp = now.isoformat()
+
+        current_heap_bytes, peak_heap_bytes = self._tracemalloc_manager.get_traced_memory()
         tracemalloc_snap = self._tracemalloc_manager.take_snapshot()
 
-        rss, vms, percent, available = self._process_info.get_process_info()
+        rss_bytes, vms_bytes, percent, available_bytes = self._process_info.get_process_info()
         gc0, gc1, gc2, collected, uncollectable = self._gc_info.get_gc_info(self._enable_gc_before_snapshot)
         total_objects = self._get_object_count()
-        object_growth = total_objects - (self._baseline_snapshot.total_objects if self._baseline_snapshot else 0)
+        object_growth = total_objects - (
+            self._baseline_snapshot.total_allocated_objects if self._baseline_snapshot else 0
+        )
+
+        native_bytes = max(0, rss_bytes - current_heap_bytes)
 
         return ComprehensiveSnapshot(
-            timestamp=time.time(),
-            python_heap_current_bytes=current_heap,
-            python_heap_peak_bytes=peak_heap,
-            allocation_count=len(tracemalloc_snap.statistics("lineno")),
+            created_at=now,
+            timestamp_iso8601=iso_timestamp,
+            current_python_heap_memory=self._format_memory(current_heap_bytes),
+            peak_python_heap_memory=self._format_memory(peak_heap_bytes),
+            resident_set_size_memory=self._format_memory(rss_bytes),
+            virtual_memory_size=self._format_memory(vms_bytes),
+            system_available_memory=self._format_memory(available_bytes),
+            native_memory_allocated=self._format_memory(native_bytes),
+            memory_usage_percent=percent,
+            total_allocated_objects=total_objects,
+            object_growth_since_baseline=object_growth,
+            gc_generation0_collections=gc0,
+            gc_generation1_collections=gc1,
+            gc_generation2_collections=gc2,
+            gc_objects_collected=collected,
+            gc_uncollectable_objects=uncollectable,
+            allocation_sites_tracked=len(tracemalloc_snap.statistics("lineno")),
+            memory_unit=self._memory_unit,
+            decimal_precision=self._decimal_places,
             tracemalloc_snapshot=tracemalloc_snap,
-            rss_bytes=rss,
-            vms_bytes=vms,
-            percent_memory=percent,
-            available_memory_bytes=available,
-            gc_gen0_count=gc0,
-            gc_gen1_count=gc1,
-            gc_gen2_count=gc2,
-            gc_collected=collected,
-            gc_uncollectable=uncollectable,
-            total_objects=total_objects,
-            object_growth=object_growth,
-            context_info=context_info,
+            context_metadata=context_metadata,
         )
 
     def snapshot(self, label: str | None = None) -> ComprehensiveSnapshot:
@@ -265,7 +261,7 @@ class MemoryProfiler:
         self._current_snapshot = snap
         return snap
 
-    def detect_leaks(self, threshold_mb: float = 1.0, *, force_gc: bool = True) -> LeakReport:
+    def detect_leaks(self, threshold: float = 1.0, *, force_gc: bool = True) -> LeakReport:
         if force_gc:
             gc.collect()
 
@@ -281,23 +277,24 @@ class MemoryProfiler:
 
         if len(self._snapshots) >= 2:
             first, last = self._snapshots[0], self._snapshots[-1]
-            object_growth = last.total_objects - first.total_objects
+            unit = first.memory_unit
+            object_growth = last.total_allocated_objects - first.total_allocated_objects
 
             if object_growth > DEFAULT_OBJECT_GROWTH_THRESHOLD:
                 recommendations.append(
                     f"Object count grew by {object_growth:,} objects. Check for accumulating collections or caches."
                 )
 
-            heap_growth_mb = (last.python_heap_current_bytes - first.python_heap_current_bytes) / BYTES_PER_MB
-            rss_growth_mb = (last.rss_bytes - first.rss_bytes) / BYTES_PER_MB
+            heap_growth = last.current_python_heap_memory - first.current_python_heap_memory
+            rss_growth = last.resident_set_size_memory - first.resident_set_size_memory
 
-            if heap_growth_mb > threshold_mb:
-                recommendations.append(f"Python heap grew by {heap_growth_mb:.1f} MB. Review large allocations.")
+            if heap_growth > threshold:
+                recommendations.append(f"Python heap grew by {heap_growth:.1f} {unit}. Review large allocations.")
 
-            if rss_growth_mb > heap_growth_mb + threshold_mb:
+            if rss_growth > heap_growth + threshold:
                 native_leak = True
                 recommendations.append(
-                    f"RSS grew {rss_growth_mb:.1f} MB but heap only grew {heap_growth_mb:.1f} MB. "
+                    f"RSS grew {rss_growth:.1f} {unit} but heap only grew {heap_growth:.1f} {unit}. "
                     "Possible native/C extension leak."
                 )
 
@@ -375,7 +372,9 @@ class MemoryProfiler:
         limit: int = 10,
         key_type: KeyType = "lineno",
     ) -> list[AllocationDifference]:
-        snapshots = {snap.context_info.get("label"): snap for snap in self._snapshots if "label" in snap.context_info}
+        snapshots = {
+            snap.context_metadata.get("label"): snap for snap in self._snapshots if "label" in snap.context_metadata
+        }
 
         if before_snap := snapshots.get(before_label):
             if after_snap := snapshots.get(after_label):
@@ -410,9 +409,21 @@ class MemoryProfiler:
                 f"Snapshot with label '{before_label}' not found. Available labels: {list(snapshots.keys())}"
             )
 
-    def __enter__(self) -> ComprehensiveSnapshot:
+    @property
+    def baseline(self) -> ComprehensiveSnapshot | None:
+        return self._baseline_snapshot
+
+    @property
+    def latest(self) -> ComprehensiveSnapshot | None:
+        return self._current_snapshot
+
+    @property
+    def all_snapshots(self) -> list[ComprehensiveSnapshot]:
+        return list(self._snapshots)
+
+    def __enter__(self) -> Self:
         self._start_profiling()
-        return self.snapshot()
+        return self
 
     def __exit__(
         self,
@@ -425,9 +436,9 @@ class MemoryProfiler:
         finally:
             self._stop_profiling()
 
-    async def __aenter__(self) -> ComprehensiveSnapshot:
+    async def __aenter__(self) -> Self:
         self._start_profiling()
-        return self.snapshot()
+        return self
 
     async def __aexit__(
         self,
@@ -444,12 +455,16 @@ class MemoryProfiler:
 @contextmanager
 def track_memory(
     *,
+    memory_unit: Unit = "mb",
+    decimal_places: int = 2,
     track_objects: bool = True,
     enable_gc: bool = False,
     baseline_snapshot: bool = False,
     max_snapshots: int | None = DEFAULT_SNAPSHOT_LIMIT,
 ) -> Generator[MemoryProfiler, None, None]:
     profiler = MemoryProfiler(
+        memory_unit=memory_unit,
+        decimal_places=decimal_places,
         track_objects=track_objects,
         enable_gc_before_snapshot=enable_gc,
         baseline_snapshot=baseline_snapshot,
@@ -463,12 +478,16 @@ def track_memory(
 @asynccontextmanager
 async def track_memory_async(
     *,
+    memory_unit: Unit = "mb",
+    decimal_places: int = 2,
     track_objects: bool = True,
     enable_gc: bool = False,
     baseline_snapshot: bool = False,
     max_snapshots: int | None = DEFAULT_SNAPSHOT_LIMIT,
 ) -> AsyncGenerator[MemoryProfiler, None]:
     profiler = MemoryProfiler(
+        memory_unit=memory_unit,
+        decimal_places=decimal_places,
         track_objects=track_objects,
         enable_gc_before_snapshot=enable_gc,
         baseline_snapshot=baseline_snapshot,
