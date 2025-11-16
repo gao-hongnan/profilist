@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import threading
 import tracemalloc
 from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import TracebackType
-from typing import Literal, Self
+from typing import Literal, Self, TypeAlias
 
 import psutil
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,10 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field
 BYTES_PER_KB: int = 1024
 BYTES_PER_MB: int = 1024 * 1024
 
-type KeyType = Literal["lineno", "filename", "traceback"]
-type Unit = Literal["bytes", "kb", "mb"]
-type MemoryValue = int | float
-type ObjectCount = int
+KeyType: TypeAlias = Literal["lineno", "filename", "traceback"]
+Unit: TypeAlias = Literal["bytes", "kb", "mb"]
+MemoryValue: TypeAlias = int | float
+ObjectCount: TypeAlias = int
 
 
 class ProfilerConfig(BaseModel):
@@ -163,6 +164,22 @@ class ProcessInfoCollector:
 
 
 class GCStatsCollector:
+    def __init__(self) -> None:
+        self._original_gc_debug = gc.get_debug()
+        self._gc_debug_enabled = False
+
+    def enable_debug_mode(self) -> None:
+        """Enable DEBUG_SAVEALL to populate gc.garbage with uncollectable objects."""
+        if not self._gc_debug_enabled:
+            gc.set_debug(gc.DEBUG_SAVEALL)
+            self._gc_debug_enabled = True
+
+    def restore_debug_mode(self) -> None:
+        """Restore original GC debug flags."""
+        if self._gc_debug_enabled:
+            gc.set_debug(self._original_gc_debug)
+            self._gc_debug_enabled = False
+
     def get_gc_info(self, enable_gc: bool) -> GCStatistics:
         gc_counts = gc.get_count()
         uncollectable = len(gc.garbage)
@@ -226,34 +243,64 @@ class MemoryProfiler:
         self._tracemalloc_manager = TracemallocManager()
         self._process_info = ProcessInfoCollector()
         self._gc_info = GCStatsCollector()
+        self._lock = threading.RLock()
 
         self._is_running = False
         self._baseline_snapshot: Snapshot | None = None
         self._current_snapshot: Snapshot | None = None
+        self._first_runtime_snapshot: Snapshot | None = None  # First snapshot after profiling starts
         self._snapshots: deque[Snapshot] = deque(maxlen=config.max_snapshots)
+        self._baseline_object_types: dict[str, int] = {}  # Track object types at baseline
 
-        if config.baseline_snapshot:
-            self._baseline_snapshot = self._create_baseline()
-
-    def _create_baseline(self) -> Snapshot:
-        try:
-            self._start_profiling()
-            return self._take_snapshot()
-        finally:
-            self._stop_profiling()
+        # Note: baseline_snapshot will be created when profiling starts, not here
+        # This avoids the start/stop gap issue
 
     def _start_profiling(self) -> None:
-        self._tracemalloc_manager.start()
-        self._is_running = True
+        with self._lock:
+            if self._is_running:
+                return
+
+            self._tracemalloc_manager.start()
+            self._gc_info.enable_debug_mode()
+            self._is_running = True
+
+            # Create baseline snapshot if configured
+            if self._config.baseline_snapshot and self._baseline_snapshot is None:
+                self._baseline_snapshot = self._take_snapshot(label="_baseline")
+                # Track object types at baseline for growth comparison
+                if self._config.track_objects:
+                    self._baseline_object_types = self._get_object_type_counts()
 
     def _stop_profiling(self) -> None:
-        self._tracemalloc_manager.stop()
-        self._is_running = False
+        with self._lock:
+            if not self._is_running:
+                return
+
+            self._tracemalloc_manager.stop()
+            self._gc_info.restore_debug_mode()
+            self._is_running = False
 
     def _get_object_count(self) -> int:
         if not self._config.track_objects:
             return 0
         return len(gc.get_objects())
+
+    def _get_object_type_counts(self, sample_size: int | None = None) -> dict[str, int]:
+        """Get counts of object types. Returns all types if sample_size is None."""
+        if not self._config.track_objects:
+            return {}
+
+        obj_types: dict[str, int] = {}
+        all_objects = gc.get_objects()
+
+        # If sample_size specified, use it; otherwise count all objects
+        limit = min(len(all_objects), sample_size) if sample_size else len(all_objects)
+
+        for obj in all_objects[:limit]:
+            type_name = type(obj).__name__
+            obj_types[type_name] = obj_types.get(type_name, 0) + 1
+
+        return obj_types
 
     def _convert_bytes(self, value_bytes: int) -> MemoryValue:
         match self._config.memory_unit:
@@ -314,86 +361,117 @@ class MemoryProfiler:
         )
 
     def snapshot(self, label: str | None = None) -> Snapshot:
-        if not self._is_running:
-            raise RuntimeError("Profiler is not running. Use as context manager or call start().")
+        with self._lock:
+            if not self._is_running:
+                raise RuntimeError("Profiler is not running. Use as context manager or call start().")
 
-        snap = self._take_snapshot(label=label)
-        self._snapshots.append(snap)
-        self._current_snapshot = snap
-        return snap
+            # Check for duplicate labels
+            if label is not None:
+                existing_labels = {snap.metadata.label for snap in self._snapshots if snap.metadata.label is not None}
+                if label in existing_labels:
+                    import warnings
 
-    def detect_leaks(self, threshold_bytes: int = BYTES_PER_MB, *, force_gc: bool = True) -> LeakReport:
-        if force_gc:
-            gc.collect()
-
-        circular_refs: list[CircularReference] = []
-        native_leak_suspected = False
-        memory_growth: MemoryGrowth | None = None
-
-        if gc.garbage:
-            for obj in gc.garbage[: self._config.circular_ref_sample_limit]:
-                referrers = gc.get_referrers(obj)
-                if referrers:
-                    circular_refs.append(
-                        CircularReference(
-                            object_type=type(obj).__name__,
-                            referrer_types=[
-                                type(r).__name__ for r in referrers[: self._config.circular_ref_referrer_limit]
-                            ],
-                        )
+                    warnings.warn(
+                        f"Snapshot with label '{label}' already exists and will be overwritten in comparisons.",
+                        UserWarning,
+                        stacklevel=2,
                     )
 
-        if len(self._snapshots) >= 2:
-            first, last = self._snapshots[0], self._snapshots[-1]
+            snap = self._take_snapshot(label=label)
+            self._snapshots.append(snap)
+            self._current_snapshot = snap
 
-            heap_growth = last.heap_memory.current - first.heap_memory.current
-            rss_growth = last.process_memory.resident_set_size - first.process_memory.resident_set_size
-            object_count_growth = (
-                last.object_tracking.total_allocated_objects - first.object_tracking.total_allocated_objects
-            )
+            # Track first runtime snapshot for growth calculations
+            if self._first_runtime_snapshot is None and label != "_baseline":
+                self._first_runtime_snapshot = snap
 
-            memory_growth = MemoryGrowth(
-                heap_growth=heap_growth,
-                rss_growth=rss_growth,
-                object_count_growth=object_count_growth,
-                unit=self._config.memory_unit,
-            )
+            return snap
+
+    def detect_leaks(self, threshold_bytes: int = BYTES_PER_MB, *, force_gc: bool = True) -> LeakReport:
+        with self._lock:
+            if force_gc:
+                gc.collect()
 
             threshold = self._convert_bytes(threshold_bytes)
-            if rss_growth > heap_growth + threshold:
-                native_leak_suspected = True
+            circular_refs: list[CircularReference] = []
+            native_leak_suspected = False
+            memory_growth: MemoryGrowth | None = None
 
-        top_growing_types: dict[str, int] = {}
-        if self._config.track_objects:
-            obj_types: dict[str, int] = {}
-            all_objects = gc.get_objects()
-            sample_size = min(len(all_objects), self._config.leak_detection_sample_size)
-            for obj in all_objects[:sample_size]:
-                obj_types[type(obj).__name__] = obj_types.get(type(obj).__name__, 0) + 1
-            top_growing_types = dict(sorted(obj_types.items(), key=lambda x: x[1], reverse=True)[:10])
+            # Check gc.garbage for circular references (now works with DEBUG_SAVEALL enabled)
+            if gc.garbage:
+                for obj in gc.garbage[: self._config.circular_ref_sample_limit]:
+                    referrers = gc.get_referrers(obj)
+                    if referrers:
+                        circular_refs.append(
+                            CircularReference(
+                                object_type=type(obj).__name__,
+                                referrer_types=[
+                                    type(r).__name__ for r in referrers[: self._config.circular_ref_referrer_limit]
+                                ],
+                            )
+                        )
 
-        threshold = self._convert_bytes(threshold_bytes)
-        has_leaks = bool(
-            gc.garbage
-            or circular_refs
-            or native_leak_suspected
-            or (
-                memory_growth
-                and (
-                    memory_growth.heap_growth > threshold
-                    or memory_growth.object_count_growth > self._config.object_growth_threshold
+            # Calculate memory growth using first runtime snapshot (not deque[0] which may have rotated)
+            first_snap = self._first_runtime_snapshot or self._baseline_snapshot
+            last_snap = self._current_snapshot
+
+            if first_snap and last_snap and first_snap != last_snap:
+                heap_growth = last_snap.heap_memory.current - first_snap.heap_memory.current
+                rss_growth = last_snap.process_memory.resident_set_size - first_snap.process_memory.resident_set_size
+                object_count_growth = (
+                    last_snap.object_tracking.total_allocated_objects
+                    - first_snap.object_tracking.total_allocated_objects
+                )
+
+                memory_growth = MemoryGrowth(
+                    heap_growth=heap_growth,
+                    rss_growth=rss_growth,
+                    object_count_growth=object_count_growth,
+                    unit=self._config.memory_unit,
+                )
+
+                # Detect native leaks: RSS growing much faster than heap
+                if rss_growth > heap_growth + threshold:
+                    native_leak_suspected = True
+
+            # Calculate ACTUAL growth in object types by comparing against baseline
+            top_growing_types: dict[str, int] = {}
+            if self._config.track_objects and self._baseline_object_types:
+                current_types = self._get_object_type_counts()
+
+                # Calculate growth = current - baseline
+                type_growth: dict[str, int] = {}
+                for type_name, current_count in current_types.items():
+                    baseline_count = self._baseline_object_types.get(type_name, 0)
+                    growth = current_count - baseline_count
+                    if growth > 0:  # Only include types that grew
+                        type_growth[type_name] = growth
+
+                # Get top 10 growing types
+                top_growing_types = dict(sorted(type_growth.items(), key=lambda x: x[1], reverse=True)[:10])
+
+            # Determine if leaks detected
+            has_leaks = bool(
+                gc.garbage
+                or circular_refs
+                or native_leak_suspected
+                or (
+                    memory_growth
+                    and (
+                        memory_growth.heap_growth > threshold
+                        or memory_growth.object_count_growth > self._config.object_growth_threshold
+                    )
                 )
             )
-        )
 
-        return LeakReport(
-            has_leaks=has_leaks,
-            circular_references=circular_refs,
-            top_growing_types=top_growing_types,
-            memory_growth=memory_growth,
-            uncollectable_count=len(gc.garbage),
-            native_leak_suspected=native_leak_suspected,
-        )
+            return LeakReport(
+                has_leaks=has_leaks,
+                circular_references=circular_refs,
+                top_growing_types=top_growing_types,
+                memory_growth=memory_growth,
+                uncollectable_count=len(gc.garbage),
+                native_leak_suspected=native_leak_suspected,
+            )
 
     def get_top_allocations(
         self,
@@ -401,43 +479,39 @@ class MemoryProfiler:
         key_type: KeyType = "lineno",
         snapshot: tracemalloc.Snapshot | None = None,
     ) -> list[AllocationInfo]:
-        if not self._tracemalloc_manager.is_tracing() and snapshot is None:
-            import warnings
-
-            warnings.warn(
-                "tracemalloc is not active. Use the profiler as a context manager or call start().",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return []
-
-        snap = snapshot or self._tracemalloc_manager.take_snapshot()
-        results: list[AllocationInfo] = []
-
-        for stat in snap.statistics(key_type)[:limit]:
-            filename = "<unknown>"
-            lineno = 0
-            trace: str | None = None
-
-            if stat.traceback:
-                frame = stat.traceback[0]
-                filename = frame.filename
-                lineno = frame.lineno
-                if key_type == "traceback":
-                    trace = "\n".join([f"  File {f.filename}:{f.lineno}" for f in stat.traceback])
-
-            results.append(
-                AllocationInfo(
-                    size=self._convert_bytes(stat.size),
-                    count=stat.count,
-                    filename=filename,
-                    lineno=lineno,
-                    trace=trace,
-                    unit=self._config.memory_unit,
+        with self._lock:
+            if not self._tracemalloc_manager.is_tracing() and snapshot is None:
+                raise RuntimeError(
+                    "tracemalloc is not active. Use the profiler as a context manager or start profiling first."
                 )
-            )
 
-        return results
+            snap = snapshot or self._tracemalloc_manager.take_snapshot()
+            results: list[AllocationInfo] = []
+
+            for stat in snap.statistics(key_type)[:limit]:
+                filename = "<unknown>"
+                lineno = 0
+                trace: str | None = None
+
+                if stat.traceback:
+                    frame = stat.traceback[0]
+                    filename = frame.filename
+                    lineno = frame.lineno
+                    if key_type == "traceback":
+                        trace = "\n".join([f"  File {f.filename}:{f.lineno}" for f in stat.traceback])
+
+                results.append(
+                    AllocationInfo(
+                        size=self._convert_bytes(stat.size),
+                        count=stat.count,
+                        filename=filename,
+                        lineno=lineno,
+                        trace=trace,
+                        unit=self._config.memory_unit,
+                    )
+                )
+
+            return results
 
     def compare_allocations(
         self,
@@ -446,48 +520,60 @@ class MemoryProfiler:
         limit: int = 10,
         key_type: KeyType = "lineno",
     ) -> list[AllocationDifference]:
-        snapshots = {snap.metadata.label: snap for snap in self._snapshots if snap.metadata.label is not None}
+        with self._lock:
+            # Build snapshot lookup including baseline
+            snapshots: dict[str, Snapshot] = {
+                snap.metadata.label: snap for snap in self._snapshots if snap.metadata.label is not None
+            }
 
-        before_snap = snapshots.get(before_label)
-        if before_snap is None:
-            raise ValueError(
-                f"Snapshot with label '{before_label}' not found. Available labels: {list(snapshots.keys())}"
-            )
+            # Add baseline snapshot if it exists
+            if self._baseline_snapshot and self._baseline_snapshot.metadata.label:
+                snapshots[self._baseline_snapshot.metadata.label] = self._baseline_snapshot
 
-        after_snap = snapshots.get(after_label)
-        if after_snap is None:
-            raise ValueError(
-                f"Snapshot with label '{after_label}' not found. Available labels: {list(snapshots.keys())}"
-            )
-
-        if before_snap.tracemalloc_snapshot is None:
-            raise ValueError(f"Snapshot '{before_label}' was taken when tracemalloc was not running.")
-
-        if after_snap.tracemalloc_snapshot is None:
-            raise ValueError(f"Snapshot '{after_label}' was taken when tracemalloc was not running.")
-
-        results: list[AllocationDifference] = []
-        for stat_diff in after_snap.tracemalloc_snapshot.compare_to(before_snap.tracemalloc_snapshot, key_type)[:limit]:
-            filename = "<unknown>"
-            lineno = 0
-
-            if stat_diff.traceback:
-                frame = stat_diff.traceback[0]
-                filename = frame.filename
-                lineno = frame.lineno
-
-            results.append(
-                AllocationDifference(
-                    filename=filename,
-                    lineno=lineno,
-                    size_diff=self._convert_bytes(stat_diff.size_diff),
-                    count_diff=stat_diff.count_diff,
-                    size_before=self._convert_bytes(stat_diff.size - stat_diff.size_diff),
-                    size_after=self._convert_bytes(stat_diff.size),
-                    unit=self._config.memory_unit,
+            before_snap = snapshots.get(before_label)
+            if before_snap is None:
+                available = list(snapshots.keys())
+                raise ValueError(
+                    f"Snapshot with label '{before_label}' not found. Available labels: {available}"
                 )
-            )
-        return results
+
+            after_snap = snapshots.get(after_label)
+            if after_snap is None:
+                available = list(snapshots.keys())
+                raise ValueError(
+                    f"Snapshot with label '{after_label}' not found. Available labels: {available}"
+                )
+
+            if before_snap.tracemalloc_snapshot is None:
+                raise ValueError(f"Snapshot '{before_label}' was taken when tracemalloc was not running.")
+
+            if after_snap.tracemalloc_snapshot is None:
+                raise ValueError(f"Snapshot '{after_label}' was taken when tracemalloc was not running.")
+
+            results: list[AllocationDifference] = []
+            for stat_diff in after_snap.tracemalloc_snapshot.compare_to(before_snap.tracemalloc_snapshot, key_type)[
+                :limit
+            ]:
+                filename = "<unknown>"
+                lineno = 0
+
+                if stat_diff.traceback:
+                    frame = stat_diff.traceback[0]
+                    filename = frame.filename
+                    lineno = frame.lineno
+
+                results.append(
+                    AllocationDifference(
+                        filename=filename,
+                        lineno=lineno,
+                        size_diff=self._convert_bytes(stat_diff.size_diff),
+                        count_diff=stat_diff.count_diff,
+                        size_before=self._convert_bytes(stat_diff.size - stat_diff.size_diff),
+                        size_after=self._convert_bytes(stat_diff.size),
+                        unit=self._config.memory_unit,
+                    )
+                )
+            return results
 
     @property
     def baseline(self) -> Snapshot | None:
