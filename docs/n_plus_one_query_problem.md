@@ -414,6 +414,7 @@ users = await fetch_with_children(
 | **Queries** | $N + 1$ | $2$ | $\Theta(N) \to \Theta(1)$ |
 | **Network Latency** | $\Theta(N) \cdot L$ | $\Theta(1) \cdot L$ | **N× improvement** |
 | **Database Work** | $O(N \cdot M)$ | $O(N \cdot M)$ | **Same** |
+| **Time Complexity** | $O(N \cdot M) + \Theta(N) \cdot L$ | $O(N \cdot M) + \Theta(1) \cdot L$ | **$\Theta(N)$ speedup** |
 | **Space Complexity** | $O(N \cdot M)$ | $O(N \cdot M)$ | **Same** |
 | **Code Complexity** | Simple | +10 LOC | Minimal |
 
