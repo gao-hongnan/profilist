@@ -17,11 +17,11 @@ async def example_basic_operations() -> None:
         user="postgres",
         password="postgres",
     )
-    await Database.connect(settings)
+    await Database.aconnect(settings)
 
     try:
         # 1. Execute DDL (returns row count, typically 0 for DDL)
-        await Database.execute(
+        await Database.aexecute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -40,7 +40,7 @@ async def example_basic_operations() -> None:
         print(f"Inserted {row_count} row(s)")
 
         # 3. Insert with RETURNING clause (get back the inserted row)
-        result = await Database.execute_returning(
+        result = await Database.aexecute_returning(
             "INSERT INTO users (name, email) VALUES (%s, %s) RETURNING *",
             ("Bob", "bob@example.com"),
         )
@@ -52,21 +52,21 @@ async def example_basic_operations() -> None:
             ("Diana", "diana@example.com"),
             ("Eve", "eve@example.com"),
         ]
-        row_count = await Database.executemany(
+        row_count = await Database.aexecutemany(
             "INSERT INTO users (name, email) VALUES (%s, %s)",
             users_data,
         )
         print(f"Batch inserted {row_count} row(s)")
 
         # 5. Query all rows (returns list[DictRow])
-        users = await Database.query("SELECT * FROM users ORDER BY id")
+        users = await Database.aquery("SELECT * FROM users ORDER BY id")
         print(f"\nAll users ({len(users)}):")
         for user in users:
             # DictRow works like a dict
             print(f"  {user['id']}: {user['name']} ({user['email']})")
 
         # 6. Query single row
-        user = await Database.query_one(
+        user = await Database.aquery_one(
             "SELECT * FROM users WHERE email = %s",
             ("alice@example.com",),
         )
@@ -81,24 +81,24 @@ async def example_basic_operations() -> None:
         print(f"\nUpdated {row_count} row(s)")
 
         # 8. Named parameters (dict-style)
-        users = await Database.query(
+        users = await Database.aquery(
             "SELECT * FROM users WHERE name LIKE %(pattern)s",
             {"pattern": "%Updated%"},
         )
         print(f"Users matching pattern: {len(users)}")
 
     finally:
-        await Database.disconnect()
+        await Database.adisconnect()
 
 
 async def example_transactions() -> None:
     """Demonstrate transaction management."""
     settings = DatabaseSettings()
-    await Database.connect(settings)
+    await Database.aconnect(settings)
 
     try:
         # Transaction: both operations succeed or both roll back
-        async with Database.transaction() as conn:
+        async with Database.atransaction() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO users (name, email) VALUES (%s, %s)",
@@ -114,7 +114,7 @@ async def example_transactions() -> None:
 
         # Transaction with rollback on error
         try:
-            async with Database.transaction() as conn:
+            async with Database.atransaction() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "INSERT INTO users (name, email) VALUES (%s, %s)",
@@ -129,17 +129,17 @@ async def example_transactions() -> None:
             print(f"Transaction rolled back: {e}")
 
     finally:
-        await Database.disconnect()
+        await Database.adisconnect()
 
 
 async def example_complex_operations() -> None:
     """Demonstrate complex multi-query operations."""
     settings = DatabaseSettings()
-    await Database.connect(settings)
+    await Database.aconnect(settings)
 
     try:
         # Use connection context for complex operations
-        async with Database.connection() as conn:
+        async with Database.aconnection() as conn:
             # Prepare statement and execute multiple times efficiently
             async with conn.cursor() as cur:
                 await cur.execute("PREPARE insert_user AS INSERT INTO users (name, email) VALUES ($1, $2)")
@@ -154,17 +154,17 @@ async def example_complex_operations() -> None:
                 print(f"Total users: {count[0]}")
 
     finally:
-        await Database.disconnect()
+        await Database.adisconnect()
 
 
 async def example_memory_tracking() -> None:
     """Example: Memory tracking experiment database."""
     settings = DatabaseSettings(database="memory_experiment")
-    await Database.connect(settings)
+    await Database.aconnect(settings)
 
     try:
         # Create schema for memory tracking
-        await Database.execute(
+        await Database.aexecute(
             """
             CREATE TABLE IF NOT EXISTS memory_snapshots (
                 id SERIAL PRIMARY KEY,
@@ -217,7 +217,7 @@ async def example_memory_tracking() -> None:
             print(f"  {snap['timestamp']}: {snap['rss_mb']:.2f} MB ({snap['percent_memory']}%)")
 
     finally:
-        await Database.disconnect()
+        await Database.adisconnect()
 
 
 if __name__ == "__main__":
